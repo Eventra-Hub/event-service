@@ -1,4 +1,5 @@
 import aio_pika
+import json
 from app.core.config import settings
 
 connection = None
@@ -22,3 +23,14 @@ async def close_rabbitmq():
 
 async def get_exchange():
     return exchange
+
+async def publish(routing_key: str, payload: dict):
+    if exchange is None:
+        return
+    await exchange.publish(
+        aio_pika.Message(
+            body=json.dumps(payload).encode(),
+            content_type="application/json",
+        ),
+        routing_key=routing_key,
+    )
