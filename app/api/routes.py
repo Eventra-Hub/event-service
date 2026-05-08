@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 from bson import ObjectId
-import jwt
+import httpx
 
 from app.core.config import settings
 from app.core.db import db
@@ -14,7 +14,7 @@ router = APIRouter()
 security = HTTPBearer()
 
 # ─────────────────────────────────────────
-# MODELS — what the request body looks like
+# MODELS
 # ─────────────────────────────────────────
 
 class EventCreate(BaseModel):
@@ -40,29 +40,45 @@ class EventUpdate(BaseModel):
 # ─────────────────────────────────────────
 
 def fix_id(event: dict) -> dict:
-    """MongoDB uses _id, we convert it to id for the response."""
     event["id"] = str(event["_id"])
     del event["_id"]
     return event
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Decode JWT token and return the user payload."""
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    """
+    Instead of verifying JWT locally, we ask registration-service:
+    GET /auth/me  →  returns the user profile if token is valid.
+    """
+    token = credentials.credentials
     try:
-        payload = jwt.decode(
-            credentials.credentials,
-            settings.JWT_SECRET,
-            algorithms=["HS256"]
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(
+                f"{settings.REGISTRATION_SERVICE_URL}/auth/me",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503,
+            detail="Auth service unreachable. Make sure registration-service is running."
         )
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
 
-def require_organizer(user: dict = Depends(get_current_user)):
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=403, detail="Could not verify user")
+
+    return response.json()  # { id, email, role, ... }
+
+async def require_organizer(user: dict = Depends(get_current_user)):
     """Only allow users with role = organizer."""
     if user.get("role") != "organizer":
-        raise HTTPException(status_code=403, detail="Organizer access required")
+        raise HTTPException(
+            status_code=403,
+            detail="Only organizers can perform this action"
+        )
     return user
 
 # ─────────────────────────────────────────
@@ -71,11 +87,11 @@ def require_organizer(user: dict = Depends(get_current_user)):
 
 @router.post("", status_code=201)
 async def create_event(body: EventCreate, user: dict = Depends(require_organizer)):
-    """Create a new event. Only organizers can do this."""
+    """Create event. Calls registration-service to verify organizer role."""
     event = {
         **body.model_dump(),
         "seats_left": body.capacity,
-        "organizer_id": user.get("sub") or user.get("id"),
+        "organizer_id": user.get("id") or user.get("sub"),
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }
@@ -92,7 +108,7 @@ async def create_event(body: EventCreate, user: dict = Depends(require_organizer
 
 @router.get("")
 async def list_events(category: Optional[str] = None, date: Optional[str] = None):
-    """List all events. Anyone can call this."""
+    """List all events. Public — no auth needed."""
     query = {}
     if category:
         query["category"] = category
@@ -105,7 +121,7 @@ async def list_events(category: Optional[str] = None, date: Optional[str] = None
 
 @router.get("/{id}")
 async def get_event(id: str):
-    """Get one event by ID."""
+    """Get one event by ID. Public."""
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid event ID")
 
@@ -117,8 +133,10 @@ async def get_event(id: str):
 
 
 @router.patch("/{id}")
-async def update_event(id: str, body: EventUpdate, user: dict = Depends(require_organizer)):
-    """Update event details. Only the organizer who created it can do this."""
+async def update_event(
+    id: str, body: EventUpdate, user: dict = Depends(require_organizer)
+):
+    """Update event. Only the organizer who created it."""
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid event ID")
 
@@ -126,7 +144,7 @@ async def update_event(id: str, body: EventUpdate, user: dict = Depends(require_
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    organizer_id = user.get("sub") or user.get("id")
+    organizer_id = user.get("id") or user.get("sub")
     if str(event["organizer_id"]) != str(organizer_id):
         raise HTTPException(status_code=403, detail="You can only update your own events")
 
@@ -134,7 +152,6 @@ async def update_event(id: str, body: EventUpdate, user: dict = Depends(require_
     updates["updated_at"] = datetime.utcnow()
 
     await db["events"].update_one({"_id": ObjectId(id)}, {"$set": updates})
-
     updated = await db["events"].find_one({"_id": ObjectId(id)})
 
     await publish("event.updated", {
@@ -147,7 +164,7 @@ async def update_event(id: str, body: EventUpdate, user: dict = Depends(require_
 
 @router.delete("/{id}", status_code=204)
 async def delete_event(id: str, user: dict = Depends(require_organizer)):
-    """Cancel/delete an event. Only the organizer who created it can do this."""
+    """Cancel event. Only the organizer who created it."""
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid event ID")
 
@@ -155,7 +172,7 @@ async def delete_event(id: str, user: dict = Depends(require_organizer)):
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    organizer_id = user.get("sub") or user.get("id")
+    organizer_id = user.get("id") or user.get("sub")
     if str(event["organizer_id"]) != str(organizer_id):
         raise HTTPException(status_code=403, detail="You can only delete your own events")
 
@@ -166,7 +183,7 @@ async def delete_event(id: str, user: dict = Depends(require_organizer)):
 
 @router.get("/{id}/availability")
 async def get_availability(id: str):
-    """How many seats are left? Called by registration-service."""
+    """Seats left. Called by registration-service."""
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid event ID")
 
@@ -186,11 +203,10 @@ async def get_availability(id: str):
 
 @router.post("/{id}/reserve", status_code=200)
 async def reserve_seat(id: str):
-    """Reduce seats_left by 1 atomically. Called when someone books a ticket."""
+    """Reduce seats_left by 1 atomically."""
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid event ID")
 
-    # $inc with seats_left > 0 filter = atomic, no race condition
     result = await db["events"].update_one(
         {"_id": ObjectId(id), "seats_left": {"$gt": 0}},
         {"$inc": {"seats_left": -1}}
@@ -204,7 +220,7 @@ async def reserve_seat(id: str):
 
 @router.post("/{id}/release", status_code=200)
 async def release_seat(id: str):
-    """Add 1 seat back. Called when a booking is cancelled."""
+    """Add 1 seat back when booking is cancelled."""
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid event ID")
 
