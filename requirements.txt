@@ -8,4 +8,6 @@ aio-pika==9.4.3
 httpx==0.27.2
 
 pydantic[email]==2.9.2
-pydantic-settings==2.5.2
+pydantic-settings==2.5.2 
+
+PyJWT==2.8.0
