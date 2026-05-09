@@ -47,17 +47,17 @@ def fix_id(event: dict) -> dict:
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
-    """
-    Instead of verifying JWT locally, we ask registration-service:
-    GET /auth/me  →  returns the user profile if token is valid.
-    """
     token = credentials.credentials
+
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             response = await client.get(
-                f"{settings.REGISTRATION_SERVICE_URL}/auth/me",
-                headers={"Authorization": f"Bearer {token}"}
+                f"{settings.REGISTRATION_SERVICE_URL}/auth/profile/me",
+                headers={
+                    "Authorization": f"Bearer {token}"
+                }
             )
+
     except httpx.RequestError:
         raise HTTPException(
             status_code=503,
@@ -65,20 +65,31 @@ async def get_current_user(
         )
 
     if response.status_code == 401:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token"
+        )
 
     if response.status_code != 200:
-        raise HTTPException(status_code=403, detail="Could not verify user")
-
-    return response.json()  # { id, email, role, ... }
-
-async def require_organizer(user: dict = Depends(get_current_user)):
-    """Only allow users with role = organizer."""
-    if user.get("role") != "organizer":
         raise HTTPException(
             status_code=403,
-            detail="Only organizers can perform this action"
+            detail="Could not fetch user profile"
         )
+
+    return response.json()
+
+async def require_organizer(
+    user: dict = Depends(get_current_user)
+):
+
+    role = str(user.get("role", "")).strip().lower()
+
+    if role != "organizer":
+        raise HTTPException(
+            status_code=403,
+            detail="Organizer access required"
+        )
+
     return user
 
 # ─────────────────────────────────────────

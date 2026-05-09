@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     RABBITMQ_URL: str
     PORT: int = 8000
     SERVICE_NAME: str = "event-service"
-    REGISTRATION_SERVICE_URL: str = "http://localhost:8003"
+    REGISTRATION_SERVICE_URL: str = "http://registration-service:8000"
 
     class Config:
         env_file = ".env"
